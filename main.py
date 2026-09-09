@@ -186,6 +186,54 @@ def init_db():
 
 init_db()
 
+def save_to_database(query, params=None):
+    """Safe database save function with error handling"""
+    try:
+        with sqlite3.connect(DB_FILE, timeout=20) as conn:
+            cursor = conn.cursor()
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            conn.commit()
+            return True
+    except sqlite3.OperationalError as e:
+        print(f"⚠️ Database lock error: {e}. Retrying...")
+        time.sleep(0.5)
+        try:
+            with sqlite3.connect(DB_FILE, timeout=20) as conn:
+                cursor = conn.cursor()
+                if params:
+                    cursor.execute(query, params)
+                else:
+                    cursor.execute(query)
+                conn.commit()
+                return True
+        except Exception as retry_err:
+            print(f"❌ Database save failed after retry: {retry_err}")
+            return False
+    except Exception as e:
+        print(f"❌ Database error: {e}")
+        return False
+
+def fetch_from_database(query, params=None, fetch_one=False):
+    """Safe database fetch function"""
+    try:
+        with sqlite3.connect(DB_FILE, timeout=20) as conn:
+            cursor = conn.cursor()
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            
+            if fetch_one:
+                return cursor.fetchone()
+            else:
+                return cursor.fetchall()
+    except Exception as e:
+        print(f"❌ Database fetch error: {e}")
+        return None if fetch_one else []
+
 def is_user_admin(chat_id, user_id):
     if OWNER_ID and user_id == OWNER_ID:
         return True
@@ -217,10 +265,7 @@ def auto_reset_midnight_loop():
         try:
             now = datetime.now(tz)
             if now.hour == 0 and now.minute == 0:
-                with sqlite3.connect(DB_FILE, timeout=20) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("UPDATE users SET msg_count = 0")
-                    conn.commit()
+                save_to_database("UPDATE users SET msg_count = 0")
                 print("⏰ Success: Daily message limit automatic reset ho gayi!")
                 time.sleep(60)
         except Exception as e:
@@ -232,108 +277,105 @@ threading.Thread(target=auto_reset_midnight_loop, daemon=True).start()
 def global_poll_manager():
     while True:
         try:
-            with sqlite3.connect(DB_FILE, timeout=20) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT chat_id, current_index, last_poll_id, last_sent_time, language, interval, auto_delete, last_warning_time FROM groups")
-                all_groups = cursor.fetchall()
-                current_now = time.time()
+            all_groups = fetch_from_database("SELECT chat_id, current_index, last_poll_id, last_sent_time, language, interval, auto_delete, last_warning_time FROM groups")
+            
+            if not all_groups:
+                time.sleep(5)
+                continue
+                
+            current_now = time.time()
 
-                for chat_id, current_index, last_poll_id, last_sent_time, language, interval, auto_delete, last_warning_time in all_groups:
-                    if current_now - last_sent_time >= interval:
-                        
+            for chat_id, current_index, last_poll_id, last_sent_time, language, interval, auto_delete, last_warning_time in all_groups:
+                if current_now - last_sent_time >= interval:
+                    
+                    is_bot_admin = False
+                    admin_check_error = None
+                    try:
+                        bot_member = bot.get_chat_member(chat_id, bot.get_me().id)
+                        if bot_member.status in ['administrator', 'creator']:
+                            is_bot_admin = True
+                        else:
+                            admin_check_error = f"Bot status: {bot_member.status}"
+                    except Exception as e:
+                        admin_check_error = str(e)
                         is_bot_admin = False
-                        admin_check_error = None
-                        try:
-                            bot_member = bot.get_chat_member(chat_id, bot.get_me().id)
-                            if bot_member.status in ['administrator', 'creator']:
-                                is_bot_admin = True
-                            else:
-                                admin_check_error = f"Bot status: {bot_member.status}"
-                        except Exception as e:
-                            admin_check_error = str(e)
-                            is_bot_admin = False
 
-                        if not is_bot_admin:
-                            print(f"⚠️ [GROUP {chat_id}] Bot is NOT admin. Error: {admin_check_error}")
-                            
-                            warning_interval = 43200
-                            if last_warning_time is None or current_now - last_warning_time >= warning_interval:
-                                try:
-                                    bot.send_message(
-                                        chat_id=chat_id, 
-                                        text="⚠️ **ALERT!**\n\nTo send polls, please re-promote me to Admin and grant permissions.",
-                                        parse_mode="Markdown"
-                                    )
-                                    cursor.execute("UPDATE groups SET last_warning_time = ? WHERE chat_id = ?", (current_now, chat_id))
-                                except Exception as warn_err:
-                                    print(f"⚠️ [GROUP {chat_id}] Warning send failed: {warn_err}")
-                            
-                            cursor.execute("UPDATE groups SET last_sent_time = ? WHERE chat_id = ?", (current_now, chat_id))
-                            conn.commit()
-                            continue
-
-                        if last_poll_id is not None and auto_delete == 1:
-                            try:
-                                bot.delete_message(chat_id=chat_id, message_id=last_poll_id)
-                            except Exception as del_err:
-                                print(f"❌ [GROUP {chat_id}] Old poll delete failed: {del_err}")
-
-                        filtered_quiz = [q for q in QUIZ_LIST if q.get("lang", "hindi") == language]
-                        if not filtered_quiz:
-                            filtered_quiz = QUIZ_LIST
-
-                        if current_index >= len(filtered_quiz):
-                            current_index = 0
-
-                        quiz = filtered_quiz[current_index]
-                        explanation_text = truncate_explanation(quiz.get("explanation", None), max_length=100)
+                    if not is_bot_admin:
+                        print(f"⚠️ [GROUP {chat_id}] Bot is NOT admin. Error: {admin_check_error}")
                         
+                        warning_interval = 43200
+                        if last_warning_time is None or current_now - last_warning_time >= warning_interval:
+                            try:
+                                bot.send_message(
+                                    chat_id=chat_id, 
+                                    text="⚠️ **ALERT!**\n\nTo send polls, please re-promote me to Admin and grant permissions.",
+                                    parse_mode="Markdown"
+                                )
+                                save_to_database("UPDATE groups SET last_warning_time = ? WHERE chat_id = ?", (current_now, chat_id))
+                            except Exception as warn_err:
+                                print(f"⚠️ [GROUP {chat_id}] Warning send failed: {warn_err}")
+                        
+                        save_to_database("UPDATE groups SET last_sent_time = ? WHERE chat_id = ?", (current_now, chat_id))
+                        continue
+
+                    if last_poll_id is not None and auto_delete == 1:
                         try:
-                            sent_message = bot.send_poll(
-                                chat_id=chat_id,
-                                question=quiz["question"],
-                                options=quiz["options"],
-                                type="quiz",
-                                correct_option_id=quiz["correct_id"],
-                                is_anonymous=False,  
-                                explanation=explanation_text
-                            )
-                            new_poll_id = sent_message.message_id
-                            poll_api_id = sent_message.poll.id
-                            
-                            cursor.execute("INSERT INTO poll_mapping (poll_id, chat_id, correct_id, creation_time) VALUES (?, ?, ?, ?)", 
-                                           (poll_api_id, chat_id, quiz["correct_id"], time.time()))
+                            bot.delete_message(chat_id=chat_id, message_id=last_poll_id)
+                        except Exception as del_err:
+                            print(f"❌ [GROUP {chat_id}] Old poll delete failed: {del_err}")
 
-                            new_index = (current_index + 1) % len(filtered_quiz)
-                            cursor.execute('''
-                                UPDATE groups 
-                                SET current_index = ?, last_poll_id = ?, last_sent_time = ? 
-                                WHERE chat_id = ?
-                            ''', (new_index, new_poll_id, current_now, chat_id))
-                            conn.commit()
-                            print(f"✅ [GROUP {chat_id}] Poll sent successfully")
+                    filtered_quiz = [q for q in QUIZ_LIST if q.get("lang", "hindi") == language]
+                    if not filtered_quiz:
+                        filtered_quiz = QUIZ_LIST
 
-                        except Exception as e:
-                            error_str = str(e).lower()
-                            print(f"❌ [GROUP {chat_id}] Poll send failed: {e}")
-                            
-                            if "bot was kicked" in error_str or "chat not found" in error_str or "bot is not a member" in error_str:
-                                cursor.execute("DELETE FROM groups WHERE chat_id = ?", (chat_id,))
-                                conn.commit()
-                                print(f"🗑️ [GROUP {chat_id}] Removed from database (bot kicked/left)")
-                            else:
-                                cursor.execute("UPDATE groups SET last_sent_time = ? WHERE chat_id = ?", (current_now, chat_id))
-                                conn.commit()
+                    if current_index >= len(filtered_quiz):
+                        current_index = 0
+
+                    quiz = filtered_quiz[current_index]
+                    explanation_text = truncate_explanation(quiz.get("explanation", None), max_length=100)
+                    
+                    try:
+                        sent_message = bot.send_poll(
+                            chat_id=chat_id,
+                            question=quiz["question"],
+                            options=quiz["options"],
+                            type="quiz",
+                            correct_option_id=quiz["correct_id"],
+                            is_anonymous=False,  
+                            explanation=explanation_text
+                        )
+                        new_poll_id = sent_message.message_id
+                        poll_api_id = sent_message.poll.id
+                        
+                        save_to_database("INSERT INTO poll_mapping (poll_id, chat_id, correct_id, creation_time) VALUES (?, ?, ?, ?)", 
+                                       (poll_api_id, chat_id, quiz["correct_id"], time.time()))
+
+                        new_index = (current_index + 1) % len(filtered_quiz)
+                        save_to_database('''
+                            UPDATE groups 
+                            SET current_index = ?, last_poll_id = ?, last_sent_time = ? 
+                            WHERE chat_id = ?
+                        ''', (new_index, new_poll_id, current_now, chat_id))
+                        
+                        print(f"✅ [GROUP {chat_id}] Poll sent successfully")
+
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        print(f"❌ [GROUP {chat_id}] Poll send failed: {e}")
+                        
+                        if "bot was kicked" in error_str or "chat not found" in error_str or "bot is not a member" in error_str:
+                            save_to_database("DELETE FROM groups WHERE chat_id = ?", (chat_id,))
+                            print(f"🗑️ [GROUP {chat_id}] Removed from database (bot kicked/left)")
+                        else:
+                            save_to_database("UPDATE groups SET last_sent_time = ? WHERE chat_id = ?", (current_now, chat_id))
                                 
         except Exception as db_err:
             print(f"❌ Database loop error: {db_err}")
         time.sleep(5)
 
 def get_settings_markup(chat_id):
-    with sqlite3.connect(DB_FILE, timeout=20) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT language, interval, auto_delete FROM groups WHERE chat_id = ?", (chat_id,))
-        res = cursor.fetchone()
+    res = fetch_from_database("SELECT language, interval, auto_delete FROM groups WHERE chat_id = ?", (chat_id,), fetch_one=True)
+    
     if not res: return None, None
     lang, interval, auto_delete = res[0], res[1], res[2]
     interval_mins = interval // 60
@@ -368,10 +410,7 @@ def get_settings_markup(chat_id):
     return text, markup
 
 def get_autodelete_markup(chat_id):
-    with sqlite3.connect(DB_FILE, timeout=20) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT auto_delete FROM groups WHERE chat_id = ?", (chat_id,))
-        res = cursor.fetchone()
+    res = fetch_from_database("SELECT auto_delete FROM groups WHERE chat_id = ?", (chat_id,), fetch_one=True)
     auto_delete = res[0] if res else 1
     status_text = "ON" if auto_delete == 1 else "OFF"
     text = (
@@ -407,11 +446,8 @@ def group_settings(message):
         except Exception: pass
         return
         
-    with sqlite3.connect(DB_FILE, timeout=20) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT settings_msg_id FROM groups WHERE chat_id = ?", (message.chat.id,))
-        row = cursor.fetchone()
-        old_msg_id = row[0] if row and row[0] else 0
+    row = fetch_from_database("SELECT settings_msg_id FROM groups WHERE chat_id = ?", (message.chat.id,), fetch_one=True)
+    old_msg_id = row[0] if row and row[0] else 0
 
     if old_msg_id > 0:
         try:
@@ -424,10 +460,7 @@ def group_settings(message):
         try: 
             new_msg = bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
             
-            with sqlite3.connect(DB_FILE, timeout=20) as conn:
-                cursor = conn.cursor()
-                cursor.execute("UPDATE groups SET settings_msg_id = ? WHERE chat_id = ?", (new_msg.message_id, message.chat.id))
-                conn.commit()
+            save_to_database("UPDATE groups SET settings_msg_id = ? WHERE chat_id = ?", (new_msg.message_id, message.chat.id))
                 
             try:
                 bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
@@ -451,10 +484,7 @@ def handle_settings_callbacks(call):
         return
 
     if action == "panel" and sub_action == "close":
-        with sqlite3.connect(DB_FILE, timeout=20) as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE groups SET settings_msg_id = 0 WHERE chat_id = ?", (chat_id,))
-            conn.commit()
+        save_to_database("UPDATE groups SET settings_msg_id = 0 WHERE chat_id = ?", (chat_id,))
         try: 
             bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
         except Exception: 
@@ -462,41 +492,36 @@ def handle_settings_callbacks(call):
         return
 
     show_main_menu = True
-    with sqlite3.connect(DB_FILE, timeout=20) as conn:
-        cursor = conn.cursor()
+    
+    if action == "set" and sub_action == "lang":
+        res = fetch_from_database("SELECT language FROM groups WHERE chat_id = ?", (chat_id,), fetch_one=True)
+        current_lang = res[0] if res else 'hindi'
+        new_lang = 'english' if current_lang == 'hindi' else 'hindi'
+        save_to_database("UPDATE groups SET language = ? WHERE chat_id = ?", (new_lang, chat_id))
+        bot.answer_callback_query(call.id, f"Language changed to {new_lang.upper()} / भाषा बदल दी गई है।")
         
-        if action == "set" and sub_action == "lang":
-            cursor.execute("SELECT language FROM groups WHERE chat_id = ?", (chat_id,))
-            res = cursor.fetchone()
-            current_lang = res[0] if res else 'hindi'
-            new_lang = 'english' if current_lang == 'hindi' else 'hindi'
-            cursor.execute("UPDATE groups SET language = ? WHERE chat_id = ?", (new_lang, chat_id))
-            bot.answer_callback_query(call.id, f"Language changed to {new_lang.upper()} / भाषा बदल दी गई है।")
-            
-        elif action == "set" and sub_action == "time":
-            new_interval = int(data_parts[2]) 
-            cursor.execute("UPDATE groups SET interval = ? WHERE chat_id = ?", (new_interval, chat_id))
-            bot.answer_callback_query(call.id, f"समय अंतराल बदलकर {new_interval // 60} मिनट कर दिया गया है।")
-            
-        elif action == "menu" and sub_action == "autodel":
+    elif action == "set" and sub_action == "time":
+        new_interval = int(data_parts[2]) 
+        save_to_database("UPDATE groups SET interval = ? WHERE chat_id = ?", (new_interval, chat_id))
+        bot.answer_callback_query(call.id, f"समय अंतराल बदलकर {new_interval // 60} मिनट कर दिया गया है।")
+        
+    elif action == "menu" and sub_action == "autodel":
+        show_main_menu = False
+        bot.answer_callback_query(call.id) 
+        
+    elif action == "autodel":
+        if sub_action == "on":
+            save_to_database("UPDATE groups SET auto_delete = 1 WHERE chat_id = ?", (chat_id,))
+            bot.answer_callback_query(call.id, "Auto-Delete चालू (ON) कर दिया गया है।")
             show_main_menu = False
-            bot.answer_callback_query(call.id) 
-            
-        elif action == "autodel":
-            if sub_action == "on":
-                cursor.execute("UPDATE groups SET auto_delete = 1 WHERE chat_id = ?", (chat_id,))
-                bot.answer_callback_query(call.id, "Auto-Delete चालू (ON) कर दिया गया है।")
-                show_main_menu = False
-            elif sub_action == "off":
-                cursor.execute("UPDATE groups SET auto_delete = 0 WHERE chat_id = ?", (chat_id,))
-                bot.answer_callback_query(call.id, "Auto-Delete बंद (OFF) कर दिया गया है।")
-                show_main_menu = False
-            elif sub_action == "back":
-                bot.answer_callback_query(call.id, "मुख्य मेनू पर वापस जा रहे हैं...")
-                show_main_menu = True
-                
-        conn.commit()
-        
+        elif sub_action == "off":
+            save_to_database("UPDATE groups SET auto_delete = 0 WHERE chat_id = ?", (chat_id,))
+            bot.answer_callback_query(call.id, "Auto-Delete बंद (OFF) कर दिया गया है।")
+            show_main_menu = False
+        elif sub_action == "back":
+            bot.answer_callback_query(call.id, "मुख्य मेनू पर वापस जा रहे हैं...")
+            show_main_menu = True
+    
     if show_main_menu: 
         text, markup = get_settings_markup(chat_id)
     else: 
@@ -521,42 +546,36 @@ def handle_poll_answer(poll_answer):
     if not poll_answer.option_ids:
         return
 
-    with sqlite3.connect(DB_FILE, timeout=20) as conn:
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT chat_id, correct_id, creation_time FROM poll_mapping WHERE poll_id = ?", (poll_id,))
-        mapping = cursor.fetchone()
-        
-        if not mapping:
-            print(f"⚠️ Warning: Poll ID {poll_id} not found in database mapping.")
-            return  
+    mapping = fetch_from_database("SELECT chat_id, correct_id, creation_time FROM poll_mapping WHERE poll_id = ?", (poll_id,), fetch_one=True)
+    
+    if not mapping:
+        print(f"⚠️ Warning: Poll ID {poll_id} not found in database mapping.")
+        return  
 
-        chat_id = mapping[0]
-        correct_id = mapping[1]
-        creation_time = mapping[2] if mapping[2] is not None else time.time()
-        chosen_option = poll_answer.option_ids[0]
-        
-        if time.time() - creation_time > 86400:
-            return  
+    chat_id = mapping[0]
+    correct_id = mapping[1]
+    creation_time = mapping[2] if mapping[2] is not None else time.time()
+    chosen_option = poll_answer.option_ids[0]
+    
+    if time.time() - creation_time > 86400:
+        return  
 
-        if chosen_option == correct_id:
-            cursor.execute('''
-                INSERT INTO daily_scores (chat_id, user_id, user_name, correct_count, wrong_count)
-                VALUES (?, ?, ?, 1, 0)
-                ON CONFLICT(chat_id, user_id) DO UPDATE SET
-                user_name = excluded.user_name,
-                correct_count = daily_scores.correct_count + 1
-            ''', (chat_id, user_id, user_name))
-        else:
-            cursor.execute('''
-                INSERT INTO daily_scores (chat_id, user_id, user_name, correct_count, wrong_count)
-                VALUES (?, ?, ?, 0, 1)
-                ON CONFLICT(chat_id, user_id) DO UPDATE SET
-                user_name = excluded.user_name,
-                wrong_count = daily_scores.wrong_count + 1
-            ''', (chat_id, user_id, user_name))
-            
-        conn.commit()
+    if chosen_option == correct_id:
+        save_to_database('''
+            INSERT INTO daily_scores (chat_id, user_id, user_name, correct_count, wrong_count)
+            VALUES (?, ?, ?, 1, 0)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET
+            user_name = excluded.user_name,
+            correct_count = daily_scores.correct_count + 1
+        ''', (chat_id, user_id, user_name))
+    else:
+        save_to_database('''
+            INSERT INTO daily_scores (chat_id, user_id, user_name, correct_count, wrong_count)
+            VALUES (?, ?, ?, 0, 1)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET
+            user_name = excluded.user_name,
+            wrong_count = daily_scores.wrong_count + 1
+        ''', (chat_id, user_id, user_name))
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -587,11 +606,8 @@ def send_welcome(message):
         print(f"इमेज फोल्डर रीड करने में एरर: {e}")
 
     if chat_type in ['group', 'supergroup']:
-        with sqlite3.connect(DB_FILE, timeout=20) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT start_msg_id FROM groups WHERE chat_id = ?", (message.chat.id,))
-            row = cursor.fetchone()
-            old_start_id = row[0] if row is not None else 0
+        row = fetch_from_database("SELECT start_msg_id FROM groups WHERE chat_id = ?", (message.chat.id,), fetch_one=True)
+        old_start_id = row[0] if row is not None else 0
 
         if old_start_id > 0:
             try: 
@@ -636,14 +652,8 @@ def send_welcome(message):
                 pass
 
         if new_msg:
-            try:
-                with sqlite3.connect(DB_FILE, timeout=20) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("INSERT OR IGNORE INTO groups (chat_id) VALUES (?)", (message.chat.id,))
-                    cursor.execute("UPDATE groups SET start_msg_id = ? WHERE chat_id = ?", (new_msg.message_id, message.chat.id))
-                    conn.commit()
-            except Exception: 
-                pass
+            save_to_database("INSERT OR IGNORE INTO groups (chat_id) VALUES (?)", (message.chat.id,))
+            save_to_database("UPDATE groups SET start_msg_id = ? WHERE chat_id = ?", (new_msg.message_id, message.chat.id))
 
         try:
             bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
@@ -652,17 +662,11 @@ def send_welcome(message):
 
         return
 
-    with sqlite3.connect(DB_FILE, timeout=20) as conn:
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO users (user_id, user_name, join_time) VALUES (?, ?, ?)", (user_id, full_name, time.time()))
-        conn.commit()
+    save_to_database("INSERT OR IGNORE INTO users (user_id, user_name, join_time) VALUES (?, ?, ?)", (user_id, full_name, time.time()))
 
     if OWNER_ID and user_id == OWNER_ID:
-        with sqlite3.connect(DB_FILE, timeout=20) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT value FROM bot_settings WHERE key = 'leaderboard_time'")
-            res = cursor.fetchone()
-            db_time = res[0] if res is not None else "22:00"
+        res = fetch_from_database("SELECT value FROM bot_settings WHERE key = 'leaderboard_time'", fetch_one=True)
+        db_time = res[0] if res is not None else "22:00"
             
         welcome_text = (
             f"👑 *Greetings, Chief ({message.from_user.first_name})!*\n\n"
@@ -724,11 +728,8 @@ def send_help(message):
             return
 
     if chat_type in ['group', 'supergroup']:
-        with sqlite3.connect(DB_FILE, timeout=20) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT help_msg_id FROM groups WHERE chat_id = ?", (message.chat.id,))
-            row = cursor.fetchone()
-            old_help_id = row[0] if row and row[0] else 0
+        row = fetch_from_database("SELECT help_msg_id FROM groups WHERE chat_id = ?", (message.chat.id,), fetch_one=True)
+        old_help_id = row[0] if row and row[0] else 0
 
         if old_help_id > 0:
             try: 
@@ -759,10 +760,7 @@ def send_help(message):
         new_help_msg = bot.send_message(chat_id=message.chat.id, text=help_text, reply_markup=markup, parse_mode="Markdown")
         
         if chat_type in ['group', 'supergroup']:
-            with sqlite3.connect(DB_FILE, timeout=20) as conn:
-                cursor = conn.cursor()
-                cursor.execute("UPDATE groups SET help_msg_id = ? WHERE chat_id = ?", (new_help_msg.message_id, message.chat.id))
-                conn.commit()
+            save_to_database("UPDATE groups SET help_msg_id = ? WHERE chat_id = ?", (new_help_msg.message_id, message.chat.id))
                 
             try:
                 bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
@@ -779,47 +777,42 @@ def handle_left_or_joined(my_chat_member):
     chat_id = my_chat_member.chat.id
     chat_title = my_chat_member.chat.title
     
-    with sqlite3.connect(DB_FILE, timeout=20) as conn:
-        cursor = conn.cursor()
+    if new_status in ["administrator", "member"]:
+        group_exists = fetch_from_database("SELECT chat_id FROM groups WHERE chat_id = ?", (chat_id,), fetch_one=True)
         
-        if new_status in ["administrator", "member"]:
-            cursor.execute("SELECT chat_id FROM groups WHERE chat_id = ?", (chat_id,))
-            group_exists = cursor.fetchone()
+        if not group_exists or old_status in ["left", "kicked"]:
+            if not group_exists:
+                save_to_database("INSERT OR IGNORE INTO groups (chat_id, interval, last_sent_time) VALUES (?, 1800, 0)", (chat_id,))
             
-            if not group_exists or old_status in ["left", "kicked"]:
-                if not group_exists:
-                    cursor.execute("INSERT OR IGNORE INTO groups (chat_id, interval, last_sent_time) VALUES (?, 1800, 0)", (chat_id,))
-                    conn.commit()
-                
-                group_text = (
-                    f"🌟 *Hey everyone,* I'm poll bot, Thanks for the invite 💖\n\n"
-                    f"🎉 *Join Group Successfully!*\n"
-                    f"🇮🇳 *Group Name:* [{chat_title}]\n"
-                    f"📢 Automated quizzes have been activated for this group.\n\n"
-                    f"This bot is the easiest way to keep your groups active and engaged.\n\n"
-                    f"📌 *My Features:*\n"
-                    f"📊 *Daily Auto Poll:* Automatically sends a new poll every day at your set time interval.\n"
-                    f"🏆 *Auto Result:* Generates results daily at 10 PM showing the Top 20 users' scores with negative marking.\n"
-                    f"💡 *Results* ka wait nahi karna chahte to `/myscore` command send kare!\n\n"
-                    f"🚀 *How to Get Started:*\n"
-                    f"1. Make me a *Group Admin (so I have permission to send polls).*\n"
-                    f"2. Use the *`/settings`* command inside your group to configure everything.\n\n"
-                    f"For any help, simply type *`/help`*."
-                )
-                
-                group_markup = InlineKeyboardMarkup()
-                add_to_group_url = f"https://t.me/{BOT_USERNAME}?startgroup=true"
-                group_markup.add(InlineKeyboardButton(text="✨ ᴀᴅᴅ ᴍᴇ ɪɴ ʏᴏᴜʀ ɢʀᴏᴜᴘ", url=add_to_group_url, style="primary"))
-                
+            group_text = (
+                f"🌟 *Hey everyone,* I'm poll bot, Thanks for the invite 💖\n\n"
+                f"🎉 *Join Group Successfully!*\n"
+                f"🇮🇳 *Group Name:* [{chat_title}]\n"
+                f"📢 Automated quizzes have been activated for this group.\n\n"
+                f"This bot is the easiest way to keep your groups active and engaged.\n\n"
+                f"📌 *My Features:*\n"
+                f"📊 *Daily Auto Poll:* Automatically sends a new poll every day at your set time interval.\n"
+                f"🏆 *Auto Result:* Generates results daily at 10 PM showing the Top 20 users' scores with negative marking.\n"
+                f"💡 *Results* ka wait nahi karna chahte to `/myscore` command send kare!\n\n"
+                f"🚀 *How to Get Started:*\n"
+                f"1. Make me a *Group Admin (so I have permission to send polls).*\n"
+                f"2. Use the *`/settings`* command inside your group to configure everything.\n\n"
+                f"For any help, simply type *`/help`*."
+            )
+            
+            group_markup = InlineKeyboardMarkup()
+            add_to_group_url = f"https://t.me/{BOT_USERNAME}?startgroup=true"
+            group_markup.add(InlineKeyboardButton(text="✨ ᴀᴅᴅ ᴍᴇ ɪɴ ʏᴏᴜʀ ɢʀᴏᴜᴘ", url=add_to_group_url, style="primary"))
+            
+            try:
+                bot.send_message(chat_id=chat_id, text=group_text, reply_markup=group_markup, parse_mode="Markdown")
+            except Exception:
                 try:
                     bot.send_message(chat_id=chat_id, text=group_text, reply_markup=group_markup, parse_mode="Markdown")
-                except Exception:
-                    try:
-                        bot.send_message(chat_id=chat_id, text=group_text, reply_markup=group_markup, parse_mode="Markdown")
-                    except Exception: pass
-                
-        elif new_status in ["left", "kicked"]:
-            cleanup_group_data(chat_id, DB_FILE)
+                except Exception: pass
+            
+    elif new_status in ["left", "kicked"]:
+        cleanup_group_data(chat_id, DB_FILE)
 
 # ❤️‍🩹 थ्रेड्स स्टार्ट करें
 threading.Thread(target=global_poll_manager, daemon=True).start()
@@ -833,14 +826,11 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     
     # Render के लिए WEBHOOK_URL को dynamically generate करें
-    # Render पर RENDER_EXTERNAL_HOSTNAME environment variable automatic में set होता है
     render_hostname = os.environ.get('RENDER_EXTERNAL_HOSTNAME')
     
     if render_hostname:
-        # अगर Render पर है तो hostname use करें
         webhook_url = f"https://{render_hostname}/"
     else:
-        # Local या अन्य platform के लिए fallback
         webhook_url = os.environ.get('WEBHOOK_URL', f"http://localhost:{port}/")
     
     # Webhook setup करें
