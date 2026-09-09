@@ -832,17 +832,26 @@ print("✅ Successfully initialized bot! 🚀")
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     
+    # Render के लिए WEBHOOK_URL को dynamically generate करें
+    # Render पर RENDER_EXTERNAL_HOSTNAME environment variable automatic में set होता है
+    render_hostname = os.environ.get('RENDER_EXTERNAL_HOSTNAME')
+    
+    if render_hostname:
+        # अगर Render पर है तो hostname use करें
+        webhook_url = f"https://{render_hostname}/"
+    else:
+        # Local या अन्य platform के लिए fallback
+        webhook_url = os.environ.get('WEBHOOK_URL', f"http://localhost:{port}/")
+    
     # Webhook setup करें
     try:
-        WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
-        if WEBHOOK_URL:
-            bot.remove_webhook()
-            bot.set_webhook(url=WEBHOOK_URL)
-            print(f"✅ Webhook set: {WEBHOOK_URL}")
-        else:
-            print("⚠️ WEBHOOK_URL not set, please configure it in Render")
+        bot.remove_webhook()
+        bot.set_webhook(url=webhook_url)
+        print(f"✅ Webhook successfully set to: {webhook_url}")
     except Exception as e:
-        print(f"Webhook setup error: {e}")
+        print(f"❌ Webhook setup error: {e}")
+        print(f"⚠️ Bot will try to work anyway, but webhooks may not function properly")
     
-    print(f"🚀 Starting Flask server on port {port}")
+    print(f"🚀 Starting Flask server on http://0.0.0.0:{port}")
+    print(f"📡 Listening for Telegram updates...")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
